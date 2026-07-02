@@ -17,7 +17,26 @@ namespace DAC {
   static uint8_t gate_ = false;
   static uint8_t filter_ = 0;
 
+  // stole this idea from bjorn
+  static uint8_t last_pitch_  = 0xFF;
+  static uint8_t last_slide_  = 0xFF;
+  static uint8_t last_accent_ = 0xFF;
+  static uint8_t last_gate_   = 0xFF;
+  static uint8_t last_filter_ = 0xFF;
+
   inline void Send() {
+    if (pitch_ == last_pitch_ && slide_ == last_slide_
+        && accent_ == last_accent_ && gate_ == last_gate_
+        && filter_ == last_filter_) {
+      // avoid making unwanted noise
+      return;
+    }
+    last_pitch_  = pitch_;
+    last_slide_  = slide_;
+    last_accent_ = accent_;
+    last_gate_   = gate_;
+    last_filter_ = filter_;
+
     // send to gate pin
     //digitalWriteFast(PI2_PIN, gate_ ? HIGH : LOW);
     // send to accent pin
@@ -29,7 +48,7 @@ namespace DAC {
     PORTE = 0; // disable latch
     // set gate and accent pins, enable latch/slide
     PORTE = (gate_ << 1) | (accent_ << 6);
-    delayMicroseconds(1);
+    //delayMicroseconds(1);
     PORTE |= 0x1; // latch on
     //delayMicroseconds(10); // make sure the latch stays on long enough?
     if (!slide_) // turn slide bit back off
