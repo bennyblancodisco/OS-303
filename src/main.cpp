@@ -1083,6 +1083,9 @@ void loop() {
 
   ++ticks;
 
+  if (GlobalSettings.Get(SETTING_NOJITTER))
+    DAC::Send();
+  else
   // simulate original interrupt timing for DAC update,
   // which will naturally beat against the clock pulses and hopefully evoke the same kind of jitter
   if (dac_timer > 1800 && (dac_stale || !clk_run)) {

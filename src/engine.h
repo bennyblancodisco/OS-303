@@ -271,7 +271,7 @@ enum SettingsFlags : uint8_t {
   SETTING_MIDI_CLOCK_TX = (1 << 3),
   SETTING_MIDI_PC_RX    = (1 << 4),
   SETTING_MIDI_PC_TX    = (1 << 5),
-  SETTING_RESERVED0     = (1 << 6),
+  SETTING_NOJITTER      = (1 << 6),
   SETTING_PATTERN_SYNC  = (1 << 7),
 };
 
