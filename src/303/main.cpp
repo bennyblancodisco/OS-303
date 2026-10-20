@@ -227,6 +227,38 @@ static void send_eeprom_chunk(uint16_t addr, uint8_t count) {
   MIDI.sendSysEx(5 + packed_len, reply);
 }
 
+static void send_full_eeprom_dump() {
+  static constexpr uint16_t EEPROM_SIZE = 4096;
+  static constexpr uint8_t CHUNK_SIZE = 32;
+
+  // Give a MIDI interface and an already-armed SysEx recorder time to notice
+  // the device after power-up. The DIN UART itself is ready immediately.
+  delay(250);
+  Leds::Set(PITCH_MODE_LED, true);
+  Leds::Set(TIME_MODE_LED, true);
+
+  for (uint16_t addr = 0; addr < EEPROM_SIZE; addr += CHUNK_SIZE) {
+    send_eeprom_chunk(addr, CHUNK_SIZE);
+
+    // Fill the eight pattern LEDs from left to right as the dump progresses.
+    Leds::Set(static_cast<OutputIndex>(addr >> 9), true);
+    for (uint8_t i = 0; i < 4; ++i) {
+      Leds::Send(false);
+      delay(1);
+    }
+  }
+
+  // Hold the completed progress display briefly, then allow normal startup.
+  for (uint8_t frame = 0; frame < 100; ++frame) {
+    for (uint8_t i = 0; i < 4; ++i) {
+      Leds::Send(false);
+      delay(1);
+    }
+  }
+  for (uint8_t i = 0; i < 4; ++i)
+    Leds::Send();
+}
+
 static void midi_sysex_cb(byte *data, unsigned sz) {
   // yeah, we're only looking for a very specific type of individual...
   if (sz < 4 || data[0] != 0xF0 || data[1] != 0x7D || data[sz - 1] != 0xF7)
@@ -455,7 +487,11 @@ void setup() {
   PollInputs(inputs);
   PollInputs(inputs);
 
-  if (inputs[TAP_NEXT].held()) {
+  // WRITE/NEXT + BACK at power-up sends one complete read-only EEPROM dump.
+  // WRITE/NEXT alone retains the existing firmware-update shortcut.
+  if (inputs[TAP_NEXT].held() && inputs[BACK_KEY].held()) {
+    send_full_eeprom_dump();
+  } else if (inputs[TAP_NEXT].held()) {
     jumptoboot();
   }
 
