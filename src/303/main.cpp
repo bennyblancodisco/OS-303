@@ -180,6 +180,53 @@ static void midi_note_on(byte channel, byte pitch, byte velocity) {
   midi_live_note   = static_cast<uint8_t>(pitch);
   dac_stale = true;
 }
+
+// Pack arbitrary 8-bit EEPROM bytes into MIDI-safe 7-bit data. Each group of
+// up to seven bytes starts with a bitmap containing their original high bits.
+static uint8_t pack_7bit(const uint8_t *src, uint8_t len, uint8_t *dst) {
+  uint8_t written = 0;
+  while (len) {
+    const uint8_t group_len = len < 7 ? len : 7;
+    uint8_t high_bits = 0;
+    const uint8_t mask_pos = written++;
+    for (uint8_t i = 0; i < group_len; ++i) {
+      high_bits |= ((src[i] >> 7) & 1) << i;
+      dst[written++] = src[i] & 0x7F;
+    }
+    dst[mask_pos] = high_bits;
+    src += group_len;
+    len -= group_len;
+  }
+  return written;
+}
+
+static void send_eeprom_chunk(uint16_t addr, uint8_t count) {
+  static constexpr uint16_t EEPROM_SIZE = 4096;
+  static constexpr uint8_t MAX_CHUNK_SIZE = 32;
+
+  if (clk_run || count == 0 || count > MAX_CHUNK_SIZE || addr >= EEPROM_SIZE)
+    return;
+
+  if (addr + count > EEPROM_SIZE)
+    count = static_cast<uint8_t>(EEPROM_SIZE - addr);
+
+  uint8_t raw[MAX_CHUNK_SIZE];
+  for (uint8_t i = 0; i < count; ++i)
+    raw[i] = storage.read(addr + i);
+
+  // F0/F7 are added by MIDI.sendSysEx(). The reply is compatible with the
+  // read-only EEPROM command in SuperOS-303:
+  //   F0 7D 57 <addr-lo7> <addr-hi7> <count> <packed data...> F7
+  uint8_t reply[5 + 37];
+  reply[0] = 0x7D;
+  reply[1] = 0x57;
+  reply[2] = addr & 0x7F;
+  reply[3] = (addr >> 7) & 0x7F;
+  reply[4] = count;
+  const uint8_t packed_len = pack_7bit(raw, count, reply + 5);
+  MIDI.sendSysEx(5 + packed_len, reply);
+}
+
 static void midi_sysex_cb(byte *data, unsigned sz) {
   // yeah, we're only looking for a very specific type of individual...
   if (sz < 4 || data[0] != 0xF0 || data[1] != 0x7D || data[sz - 1] != 0xF7)
@@ -188,6 +235,14 @@ static void midi_sysex_cb(byte *data, unsigned sz) {
   // special command to initiate flash update
   if (0x4A == data[2]) {
     jumptoboot();
+  }
+
+  // Read up to 32 bytes of internal EEPROM. This is deliberately read-only:
+  // a dropped or malformed MIDI message can never alter stored patterns.
+  // Request: F0 7D 56 <addr-lo7> <addr-hi7> <count> F7
+  if (0x56 == data[2] && sz >= 7) {
+    const uint16_t addr = data[3] | (uint16_t(data[4]) << 7);
+    send_eeprom_chunk(addr, data[5]);
   }
 }
 
