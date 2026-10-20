@@ -231,17 +231,24 @@ static void send_full_eeprom_dump() {
   static constexpr uint16_t EEPROM_SIZE = 4096;
   static constexpr uint8_t CHUNK_SIZE = 32;
 
+  // All eight numbered pattern LEDs distinguish backup from the firmware
+  // bootloader, which lights PITCH, TIME, FUNCTION and A# instead.
+  for (uint8_t i = 0; i < 8; ++i)
+    Leds::Set(static_cast<OutputIndex>(i), true);
+
   // Give a MIDI interface and an already-armed SysEx recorder time to notice
-  // the device after power-up. The DIN UART itself is ready immediately.
-  delay(250);
-  Leds::Set(PITCH_MODE_LED, true);
-  Leds::Set(TIME_MODE_LED, true);
+  // the device after power-up while keeping the multiplexed LEDs refreshed.
+  for (uint8_t frame = 0; frame < 63; ++frame) {
+    for (uint8_t i = 0; i < 4; ++i) {
+      Leds::Send(false);
+      delay(1);
+    }
+  }
 
   for (uint16_t addr = 0; addr < EEPROM_SIZE; addr += CHUNK_SIZE) {
     send_eeprom_chunk(addr, CHUNK_SIZE);
 
-    // Fill the eight pattern LEDs from left to right as the dump progresses.
-    Leds::Set(static_cast<OutputIndex>(addr >> 9), true);
+    // Keep the solid dump-mode display refreshed between MIDI chunks.
     for (uint8_t i = 0; i < 4; ++i) {
       Leds::Send(false);
       delay(1);
@@ -487,9 +494,10 @@ void setup() {
   PollInputs(inputs);
   PollInputs(inputs);
 
-  // WRITE/NEXT + BACK at power-up sends one complete read-only EEPROM dump.
-  // WRITE/NEXT alone retains the existing firmware-update shortcut.
-  if (inputs[TAP_NEXT].held() && inputs[BACK_KEY].held()) {
+  // BACK at power-up sends one complete read-only EEPROM dump. Check it first
+  // so BACK + WRITE/NEXT is also harmless and can never enter the bootloader.
+  // WRITE/NEXT without BACK retains the existing firmware-update shortcut.
+  if (inputs[BACK_KEY].held()) {
     send_full_eeprom_dump();
   } else if (inputs[TAP_NEXT].held()) {
     jumptoboot();
