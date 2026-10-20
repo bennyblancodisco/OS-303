@@ -227,43 +227,68 @@ static void send_eeprom_chunk(uint16_t addr, uint8_t count) {
   MIDI.sendSysEx(5 + packed_len, reply);
 }
 
+static void set_dump_leds(uint8_t count, bool enable = true) {
+  for (uint8_t i = 0; i < 8; ++i)
+    Leds::Set(static_cast<OutputIndex>(i), enable && i < count);
+}
+
+static void refresh_dump_leds(uint8_t frames = 1) {
+  for (uint8_t frame = 0; frame < frames; ++frame) {
+    for (uint8_t i = 0; i < 4; ++i) {
+      Leds::Send(false);
+      delay(1);
+    }
+  }
+}
+
+static void wait_for_eeprom_dump_trigger() {
+  // All eight numbered pattern LEDs distinguish armed backup mode from the
+  // firmware bootloader, which lights PITCH, TIME, FUNCTION and A# instead.
+  set_dump_leds(8);
+
+  // Require release of the power-on press, then a fresh BACK tap. This gives
+  // the user unlimited time to arm a SysEx recorder without losing the start.
+  while (!inputs[BACK_KEY].off()) {
+    PollInputs(inputs);
+    refresh_dump_leds();
+  }
+  while (true) {
+    PollInputs(inputs);
+    refresh_dump_leds();
+    if (inputs[BACK_KEY].rising())
+      return;
+  }
+}
+
 static void send_full_eeprom_dump() {
   static constexpr uint16_t EEPROM_SIZE = 4096;
   static constexpr uint8_t CHUNK_SIZE = 32;
+  static constexpr uint8_t CHUNKS_PER_LED = EEPROM_SIZE / CHUNK_SIZE / 8;
 
-  // All eight numbered pattern LEDs distinguish backup from the firmware
-  // bootloader, which lights PITCH, TIME, FUNCTION and A# instead.
-  for (uint8_t i = 0; i < 8; ++i)
-    Leds::Set(static_cast<OutputIndex>(i), true);
-
-  // Give a MIDI interface and an already-armed SysEx recorder time to notice
-  // the device after power-up while keeping the multiplexed LEDs refreshed.
-  for (uint8_t frame = 0; frame < 63; ++frame) {
-    for (uint8_t i = 0; i < 4; ++i) {
-      Leds::Send(false);
-      delay(1);
-    }
-  }
+  wait_for_eeprom_dump_trigger();
 
   for (uint16_t addr = 0; addr < EEPROM_SIZE; addr += CHUNK_SIZE) {
+    const uint8_t chunk = addr / CHUNK_SIZE;
+    const uint8_t active_led = chunk / CHUNKS_PER_LED;
+    const uint8_t segment_pos = chunk % CHUNKS_PER_LED;
+
+    // Completed 12.5% segments stay solid. The active segment blinks once,
+    // then becomes solid when its sixteen chunks have been transmitted.
+    set_dump_leds(active_led);
+    if (segment_pos < CHUNKS_PER_LED / 2)
+      Leds::Set(static_cast<OutputIndex>(active_led), true);
+
     send_eeprom_chunk(addr, CHUNK_SIZE);
-
-    // Keep the solid dump-mode display refreshed between MIDI chunks.
-    for (uint8_t i = 0; i < 4; ++i) {
-      Leds::Send(false);
-      delay(1);
-    }
+    refresh_dump_leds();
   }
 
-  // Hold the completed progress display briefly, then allow normal startup.
-  for (uint8_t frame = 0; frame < 100; ++frame) {
-    for (uint8_t i = 0; i < 4; ++i) {
-      Leds::Send(false);
-      delay(1);
-    }
+  // Flash the completed eight-LED bar together three times.
+  for (uint8_t flash = 0; flash < 3; ++flash) {
+    set_dump_leds(8);
+    refresh_dump_leds(30);
+    set_dump_leds(0);
+    refresh_dump_leds(20);
   }
-  for (uint8_t i = 0; i < 4; ++i)
-    Leds::Send();
 }
 
 static void midi_sysex_cb(byte *data, unsigned sz) {
