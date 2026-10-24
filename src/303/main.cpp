@@ -200,17 +200,294 @@ static uint8_t pack_7bit(const uint8_t *src, uint8_t len, uint8_t *dst) {
   return written;
 }
 
-static void send_eeprom_chunk(uint16_t addr, uint8_t count) {
-  static constexpr uint16_t EEPROM_SIZE = 4096;
-  static constexpr uint8_t MAX_CHUNK_SIZE = 32;
+static bool unpack_7bit(const uint8_t *src, uint8_t packed_len,
+                        uint8_t *dst, uint8_t expected_len) {
+  uint8_t read = 0;
+  uint8_t written = 0;
+  while (written < expected_len) {
+    if (read >= packed_len)
+      return false;
+    const uint8_t high_bits = src[read++];
+    const uint8_t group_len = expected_len - written < 7
+                            ? expected_len - written : 7;
+    for (uint8_t bit = 0; bit < group_len; ++bit) {
+      if (read >= packed_len)
+        return false;
+      dst[written++] = src[read++] | (((high_bits >> bit) & 1) << 7);
+    }
+  }
+  return read == packed_len;
+}
 
-  if (clk_run || count == 0 || count > MAX_CHUNK_SIZE || addr >= EEPROM_SIZE)
+static constexpr uint16_t EEPROM_IMAGE_SIZE = 4096;
+static constexpr uint8_t EEPROM_CHUNK_SIZE = 32;
+static constexpr uint8_t EEPROM_CHUNK_COUNT = EEPROM_IMAGE_SIZE / EEPROM_CHUNK_SIZE;
+
+// The last two bytes are currently unused auxiliary EEPROM. Keeping two
+// different marker values makes a power failure while clearing the marker
+// recoverable: either surviving byte forces restore mode at the next boot.
+static constexpr uint16_t RESTORE_MARKER_A_ADDR = EEPROM_IMAGE_SIZE - 2;
+static constexpr uint16_t RESTORE_MARKER_B_ADDR = EEPROM_IMAGE_SIZE - 1;
+static constexpr uint8_t RESTORE_MARKER_A = 0xA5;
+static constexpr uint8_t RESTORE_MARKER_B = 0x5A;
+static constexpr uint8_t RESTORE_PROTOCOL_VERSION = 1;
+
+enum RestoreStatus : uint8_t {
+  RESTORE_READY = 0x00,
+  RESTORE_COMPLETE = 0x01,
+  RESTORE_ERR_BEGIN = 0x40,
+  RESTORE_ERR_DATA = 0x41,
+  RESTORE_ERR_DUPLICATE = 0x42,
+  RESTORE_ERR_INCOMPLETE = 0x43,
+  RESTORE_ERR_CHECKSUM = 0x44,
+  RESTORE_ERR_SIGNATURE = 0x45,
+};
+
+static bool restore_mode_active = false;
+static bool restore_begun = false;
+static bool restore_finished = false;
+static uint8_t restore_error = RESTORE_READY;
+static uint8_t restore_received = 0;
+static uint8_t restore_seen[EEPROM_CHUNK_COUNT / 8];
+static uint16_t restore_chunk_crc[EEPROM_CHUNK_COUNT];
+static uint8_t restore_first_chunk[EEPROM_CHUNK_SIZE];
+static uint8_t restore_marker_a_image = 0xFF;
+static uint8_t restore_marker_b_image = 0xFF;
+static uint32_t restore_expected_crc32 = 0;
+
+static uint16_t crc16_ccitt(const uint8_t *data, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  while (len--) {
+    crc ^= uint16_t(*data++) << 8;
+    for (uint8_t bit = 0; bit < 8; ++bit)
+      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+  }
+  return crc;
+}
+
+static uint32_t crc32_update(uint32_t crc, uint8_t value) {
+  crc ^= value;
+  for (uint8_t bit = 0; bit < 8; ++bit)
+    crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320UL : 0);
+  return crc;
+}
+
+static void send_restore_status(uint8_t status) {
+  const uint8_t reply[] = {0x7D, 0x5B, status,
+                           static_cast<uint8_t>(restore_received & 0x7F),
+                           static_cast<uint8_t>(restore_received >> 7)};
+  MIDI.sendSysEx(sizeof(reply), reply);
+}
+
+static bool restore_marker_present() {
+  return storage.read(RESTORE_MARKER_A_ADDR) == RESTORE_MARKER_A
+      || storage.read(RESTORE_MARKER_B_ADDR) == RESTORE_MARKER_B;
+}
+
+static void restore_fail(uint8_t error) {
+  restore_error = error;
+  send_restore_status(error);
+}
+
+static void restore_begin(uint32_t expected_crc32) {
+  restore_begun = false;
+  restore_finished = false;
+  restore_error = RESTORE_READY;
+  restore_received = 0;
+  memset(restore_seen, 0, sizeof(restore_seen));
+  memset(restore_chunk_crc, 0, sizeof(restore_chunk_crc));
+  memset(restore_first_chunk, 0xFF, sizeof(restore_first_chunk));
+  restore_marker_a_image = 0xFF;
+  restore_marker_b_image = 0xFF;
+  restore_expected_crc32 = expected_crc32;
+
+  // Set the recovery marker before accepting any EEPROM writes. A repeated
+  // BEGIN is safe and restarts the transfer without clearing stored patterns.
+  storage.update(RESTORE_MARKER_B_ADDR, RESTORE_MARKER_B);
+  storage.update(RESTORE_MARKER_A_ADDR, RESTORE_MARKER_A);
+  restore_begun = true;
+  send_restore_status(RESTORE_READY);
+}
+
+static bool restore_signature_valid(const uint8_t *chunk) {
+  static const char signature[] = "OS-303-v0.8";
+  return 0 == memcmp(chunk, signature, sizeof(signature) - 1);
+}
+
+static uint32_t restore_image_crc32(bool use_pending_first_chunk = true) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (uint16_t addr = 0; addr < EEPROM_IMAGE_SIZE; ++addr) {
+    uint8_t value;
+    if (addr < EEPROM_CHUNK_SIZE && use_pending_first_chunk)
+      value = restore_first_chunk[addr];
+    else if (addr == RESTORE_MARKER_A_ADDR)
+      value = restore_marker_a_image;
+    else if (addr == RESTORE_MARKER_B_ADDR)
+      value = restore_marker_b_image;
+    else
+      value = storage.read(addr);
+    crc = crc32_update(crc, value);
+  }
+  return ~crc;
+}
+
+static void restore_data_chunk(uint16_t addr, const uint8_t *raw,
+                               uint16_t supplied_crc) {
+  if (!restore_begun || addr >= EEPROM_IMAGE_SIZE
+      || (addr % EEPROM_CHUNK_SIZE) != 0) {
+    restore_fail(RESTORE_ERR_DATA);
+    return;
+  }
+
+  const uint8_t chunk = addr / EEPROM_CHUNK_SIZE;
+  const uint16_t actual_crc = crc16_ccitt(raw, EEPROM_CHUNK_SIZE);
+  if (actual_crc != supplied_crc) {
+    restore_fail(RESTORE_ERR_CHECKSUM);
+    return;
+  }
+
+  const uint8_t bit = 1 << (chunk & 7);
+  if (restore_seen[chunk >> 3] & bit) {
+    if (restore_chunk_crc[chunk] != actual_crc)
+      restore_fail(RESTORE_ERR_DUPLICATE);
+    return;
+  }
+
+  if (addr == 0) {
+    if (!restore_signature_valid(raw)) {
+      restore_fail(RESTORE_ERR_SIGNATURE);
+      return;
+    }
+    memcpy(restore_first_chunk, raw, EEPROM_CHUNK_SIZE);
+  } else {
+    if (addr + EEPROM_CHUNK_SIZE == EEPROM_IMAGE_SIZE
+        && (raw[EEPROM_CHUNK_SIZE - 2] == RESTORE_MARKER_A
+            || raw[EEPROM_CHUNK_SIZE - 1] == RESTORE_MARKER_B)) {
+      restore_fail(RESTORE_ERR_DATA);
+      return;
+    }
+    for (uint8_t i = 0; i < EEPROM_CHUNK_SIZE; ++i) {
+      const uint16_t write_addr = addr + i;
+      if (write_addr == RESTORE_MARKER_A_ADDR)
+        restore_marker_a_image = raw[i];
+      else if (write_addr == RESTORE_MARKER_B_ADDR)
+        restore_marker_b_image = raw[i];
+      else
+        storage.update(write_addr, raw[i]);
+    }
+  }
+
+  restore_seen[chunk >> 3] |= bit;
+  restore_chunk_crc[chunk] = actual_crc;
+  ++restore_received;
+  restore_error = RESTORE_READY;
+}
+
+static void restore_commit(uint32_t supplied_crc32) {
+  if (!restore_begun || restore_received != EEPROM_CHUNK_COUNT) {
+    restore_fail(RESTORE_ERR_INCOMPLETE);
+    return;
+  }
+  if (supplied_crc32 != restore_expected_crc32
+      || restore_image_crc32() != restore_expected_crc32) {
+    restore_fail(RESTORE_ERR_CHECKSUM);
+    return;
+  }
+
+  // Settings and the EEPROM signature are deliberately committed last. The
+  // recovery marker remains active until the complete image verifies.
+  for (uint8_t i = 0; i < EEPROM_CHUNK_SIZE; ++i)
+    storage.update(i, restore_first_chunk[i]);
+  if (restore_image_crc32(false) != restore_expected_crc32) {
+    restore_fail(RESTORE_ERR_CHECKSUM);
+    return;
+  }
+
+  // Clear the two-byte recovery marker last. If power dies between these
+  // writes, the other marker byte still sends the next boot back to restore.
+  storage.update(RESTORE_MARKER_B_ADDR, restore_marker_b_image);
+  if (storage.read(RESTORE_MARKER_B_ADDR) != restore_marker_b_image) {
+    restore_fail(RESTORE_ERR_CHECKSUM);
+    return;
+  }
+  storage.update(RESTORE_MARKER_A_ADDR, restore_marker_a_image);
+  if (storage.read(RESTORE_MARKER_A_ADDR) != restore_marker_a_image) {
+    restore_fail(RESTORE_ERR_CHECKSUM);
+    return;
+  }
+  restore_begun = false;
+  restore_error = RESTORE_READY;
+  restore_finished = true;
+  send_restore_status(RESTORE_COMPLETE);
+}
+
+static void handle_restore_sysex(byte *data, unsigned sz) {
+  if (sz < 4 || data[0] != 0xF0 || data[1] != 0x7D
+      || data[sz - 1] != 0xF7)
     return;
 
-  if (addr + count > EEPROM_SIZE)
-    count = static_cast<uint8_t>(EEPROM_SIZE - addr);
+  if (data[2] == 0x58) {
+    // F0 7D 58 <version> <size-lo7> <size-hi7> <packed-crc32:5> F7
+    uint8_t crc_bytes[4];
+    if (sz != 12 || data[3] != RESTORE_PROTOCOL_VERSION
+        || !unpack_7bit(data + 6, 5, crc_bytes, 4)) {
+      restore_fail(RESTORE_ERR_BEGIN);
+      return;
+    }
+    const uint16_t image_size = data[4] | (uint16_t(data[5]) << 7);
+    if (image_size != EEPROM_IMAGE_SIZE) {
+      restore_fail(RESTORE_ERR_BEGIN);
+      return;
+    }
+    const uint32_t expected_crc = uint32_t(crc_bytes[0])
+                                | (uint32_t(crc_bytes[1]) << 8)
+                                | (uint32_t(crc_bytes[2]) << 16)
+                                | (uint32_t(crc_bytes[3]) << 24);
+    restore_begin(expected_crc);
+    return;
+  }
 
-  uint8_t raw[MAX_CHUNK_SIZE];
+  if (data[2] == 0x59) {
+    // F0 7D 59 <addr-lo7> <addr-hi7> 20 <packed-data:37>
+    //          <packed-crc16:3> F7
+    uint8_t raw[EEPROM_CHUNK_SIZE];
+    uint8_t crc_bytes[2];
+    if (sz != 47 || data[5] != EEPROM_CHUNK_SIZE
+        || !unpack_7bit(data + 6, 37, raw, EEPROM_CHUNK_SIZE)
+        || !unpack_7bit(data + 43, 3, crc_bytes, 2)) {
+      restore_fail(RESTORE_ERR_DATA);
+      return;
+    }
+    const uint16_t addr = data[3] | (uint16_t(data[4]) << 7);
+    const uint16_t supplied_crc = crc_bytes[0] | (uint16_t(crc_bytes[1]) << 8);
+    restore_data_chunk(addr, raw, supplied_crc);
+    return;
+  }
+
+  if (data[2] == 0x5A) {
+    // F0 7D 5A <packed-crc32:5> F7
+    uint8_t crc_bytes[4];
+    if (sz != 9 || !unpack_7bit(data + 3, 5, crc_bytes, 4)) {
+      restore_fail(RESTORE_ERR_DATA);
+      return;
+    }
+    const uint32_t supplied_crc = uint32_t(crc_bytes[0])
+                                | (uint32_t(crc_bytes[1]) << 8)
+                                | (uint32_t(crc_bytes[2]) << 16)
+                                | (uint32_t(crc_bytes[3]) << 24);
+    restore_commit(supplied_crc);
+  }
+}
+
+static void send_eeprom_chunk(uint16_t addr, uint8_t count) {
+  if (clk_run || count == 0 || count > EEPROM_CHUNK_SIZE
+      || addr >= EEPROM_IMAGE_SIZE)
+    return;
+
+  if (addr + count > EEPROM_IMAGE_SIZE)
+    count = static_cast<uint8_t>(EEPROM_IMAGE_SIZE - addr);
+
+  uint8_t raw[EEPROM_CHUNK_SIZE];
   for (uint8_t i = 0; i < count; ++i)
     raw[i] = storage.read(addr + i);
 
@@ -261,14 +538,12 @@ static void wait_for_eeprom_dump_trigger() {
 }
 
 static void send_full_eeprom_dump() {
-  static constexpr uint16_t EEPROM_SIZE = 4096;
-  static constexpr uint8_t CHUNK_SIZE = 32;
-  static constexpr uint8_t CHUNKS_PER_LED = EEPROM_SIZE / CHUNK_SIZE / 8;
+  static constexpr uint8_t CHUNKS_PER_LED = EEPROM_CHUNK_COUNT / 8;
 
   wait_for_eeprom_dump_trigger();
 
-  for (uint16_t addr = 0; addr < EEPROM_SIZE; addr += CHUNK_SIZE) {
-    const uint8_t chunk = addr / CHUNK_SIZE;
+  for (uint16_t addr = 0; addr < EEPROM_IMAGE_SIZE; addr += EEPROM_CHUNK_SIZE) {
+    const uint8_t chunk = addr / EEPROM_CHUNK_SIZE;
     const uint8_t active_led = chunk / CHUNKS_PER_LED;
     const uint8_t segment_pos = chunk % CHUNKS_PER_LED;
 
@@ -278,7 +553,7 @@ static void send_full_eeprom_dump() {
     if (segment_pos < CHUNKS_PER_LED / 2)
       Leds::Set(static_cast<OutputIndex>(active_led), true);
 
-    send_eeprom_chunk(addr, CHUNK_SIZE);
+    send_eeprom_chunk(addr, EEPROM_CHUNK_SIZE);
     refresh_dump_leds();
   }
 
@@ -291,10 +566,74 @@ static void send_full_eeprom_dump() {
   }
 }
 
+static void show_restore_ready(uint16_t frame) {
+  for (uint8_t i = 0; i < 8; ++i)
+    Leds::Set(static_cast<OutputIndex>(i), ((i + (frame >> 8)) & 1) == 0);
+  Leds::Set(TIME_MODE_LED, true);
+  Leds::Set(PITCH_MODE_LED, false);
+  Leds::Set(FUNCTION_MODE_LED, false);
+}
+
+static void run_restore_mode() {
+  restore_mode_active = true;
+  restore_finished = false;
+  MIDI.turnThruOff();
+
+  // Require release of the power-on chord before accepting the restore file.
+  while (!inputs[TIME_KEY].off() || !inputs[BACK_KEY].off()) {
+    PollInputs(inputs);
+    show_restore_ready(0);
+    refresh_dump_leds();
+  }
+
+  uint16_t frame = 0;
+  while (!restore_finished) {
+    while (MIDI.read()) {}
+    PollInputs(inputs);
+
+    if (restore_error >= 0x40) {
+      set_dump_leds(0);
+      Leds::Set(static_cast<OutputIndex>((frame >> 7) & 7), true);
+      Leds::Set(TIME_MODE_LED, false);
+      Leds::Set(FUNCTION_MODE_LED, true);
+    } else if (!restore_begun) {
+      show_restore_ready(frame);
+    } else {
+      const uint8_t complete_leds = restore_received / 16;
+      set_dump_leds(complete_leds);
+      if (complete_leds < 8 && (frame & 0x80))
+        Leds::Set(static_cast<OutputIndex>(complete_leds), true);
+      Leds::Set(TIME_MODE_LED, true);
+      Leds::Set(PITCH_MODE_LED, false);
+      Leds::Set(FUNCTION_MODE_LED, false);
+    }
+    refresh_dump_leds();
+    ++frame;
+  }
+
+  for (uint8_t flash = 0; flash < 3; ++flash) {
+    set_dump_leds(8);
+    refresh_dump_leds(30);
+    set_dump_leds(0);
+    refresh_dump_leds(20);
+  }
+  Leds::Set(TIME_MODE_LED, false);
+  Leds::Set(FUNCTION_MODE_LED, false);
+  restore_mode_active = false;
+  MIDI.turnThruOn(midi::Thru::Full);
+}
+
 static void midi_sysex_cb(byte *data, unsigned sz) {
   // yeah, we're only looking for a very specific type of individual...
   if (sz < 4 || data[0] != 0xF0 || data[1] != 0x7D || data[sz - 1] != 0xF7)
     return;
+
+  // EEPROM writes are recognized only inside the explicit power-on restore
+  // mode. Playing a restore file during normal operation is harmless.
+  if (restore_mode_active) {
+    handle_restore_sysex(data, sz);
+    return;
+  }
 
   // special command to initiate flash update
   if (0x4A == data[2]) {
@@ -519,11 +858,22 @@ void setup() {
   PollInputs(inputs);
   PollInputs(inputs);
 
-  // BACK at power-up sends one complete read-only EEPROM dump. Check it first
-  // so BACK + WRITE/NEXT is also harmless and can never enter the bootloader.
-  // WRITE/NEXT without BACK retains the existing firmware-update shortcut.
-  if (inputs[BACK_KEY].held()) {
+  // An interrupted restore returns here automatically. TIME + BACK explicitly
+  // enters restore; BACK alone enters read-only backup; WRITE/NEXT alone keeps
+  // the firmware-update shortcut. WRITE/NEXT also remains an emergency escape
+  // to the bootloader when a recovery marker is present.
+  const bool recovery_required = restore_marker_present();
+  if (inputs[TIME_KEY].held() && inputs[BACK_KEY].held()) {
+    run_restore_mode();
+  } else if (recovery_required && inputs[TAP_NEXT].held()
+             && inputs[BACK_KEY].off()) {
+    jumptoboot();
+  } else if (recovery_required) {
+    run_restore_mode();
+  } else if (inputs[BACK_KEY].held()) {
+    MIDI.turnThruOff();
     send_full_eeprom_dump();
+    MIDI.turnThruOn(midi::Thru::Full);
   } else if (inputs[TAP_NEXT].held()) {
     jumptoboot();
   }

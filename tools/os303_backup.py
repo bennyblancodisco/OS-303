@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Back up OS-303's 4 KiB EEPROM over DIN MIDI SysEx.
-
-The firmware side is intentionally read-only. This tool saves the complete
-response stream as a .syx file and also writes a verified raw .bin image.
-"""
+"""Back up, verify, and prepare safe restore files for OS-303 EEPROM."""
 
 from __future__ import annotations
 
@@ -11,24 +7,52 @@ import argparse
 import hashlib
 import sys
 import time
+import zlib
 from pathlib import Path
 
 try:
     import mido
-except ImportError as exc:  # pragma: no cover - exercised by users without deps
-    raise SystemExit(
-        "Missing MIDI support. Run: python3 -m pip install mido python-rtmidi"
-    ) from exc
+except ImportError:  # Offline verify/prepare-restore does not need MIDI support.
+    mido = None
 
 
 MANUFACTURER_ID = 0x7D
 CMD_READ_EEPROM = 0x56
 CMD_EEPROM_DATA = 0x57
+CMD_RESTORE_BEGIN = 0x58
+CMD_RESTORE_DATA = 0x59
+CMD_RESTORE_END = 0x5A
+RESTORE_PROTOCOL_VERSION = 1
 EEPROM_SIZE = 4096
 CHUNK_SIZE = 32
+CHUNK_COUNT = EEPROM_SIZE // CHUNK_SIZE
+RESTORE_MARKER_A_ADDR = EEPROM_SIZE - 2
+RESTORE_MARKER_B_ADDR = EEPROM_SIZE - 1
+RESTORE_MARKER_A = 0xA5
+RESTORE_MARKER_B = 0x5A
 
 
-def unpack_7bit(data: tuple[int, ...] | list[int], expected: int) -> bytes:
+def require_mido() -> None:
+    if mido is None:
+        raise SystemExit(
+            "Missing MIDI support. Run: python3 -m pip install mido python-rtmidi"
+        )
+
+
+def pack_7bit(data: bytes) -> bytes:
+    """Encode arbitrary bytes as bitmap-prefixed MIDI-safe groups."""
+    packed = bytearray()
+    for offset in range(0, len(data), 7):
+        group = data[offset : offset + 7]
+        high_bits = 0
+        for bit, value in enumerate(group):
+            high_bits |= ((value >> 7) & 1) << bit
+        packed.append(high_bits)
+        packed.extend(value & 0x7F for value in group)
+    return bytes(packed)
+
+
+def unpack_7bit(data: tuple[int, ...] | list[int] | bytes, expected: int) -> bytes:
     """Decode bitmap-prefixed groups of at most seven MIDI-safe bytes."""
     decoded = bytearray()
     pos = 0
@@ -46,6 +70,34 @@ def unpack_7bit(data: tuple[int, ...] | list[int], expected: int) -> bytes:
     if pos != len(data):
         raise ValueError("unexpected trailing packed data")
     return bytes(decoded)
+
+
+def crc16_ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for value in data:
+        crc ^= value << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def sysex_frame(data: bytes | tuple[int, ...]) -> bytes:
+    if any(value & 0x80 for value in data):
+        raise ValueError("SysEx payload contains a non-7-bit byte")
+    return bytes((0xF0, *data, 0xF7))
+
+
+def iter_sysex(wire: bytes):
+    pos = 0
+    while pos < len(wire):
+        start = wire.find(b"\xF0", pos)
+        if start < 0:
+            return
+        end = wire.find(b"\xF7", start + 1)
+        if end < 0:
+            raise ValueError("truncated SysEx message at end of file")
+        yield wire[start + 1 : end]
+        pos = end + 1
 
 
 def parse_reply(message, expected_addr: int, expected_count: int) -> bytes | None:
@@ -85,7 +137,6 @@ def request_chunk(inport, outport, addr: int, timeout: float) -> tuple[bytes, by
     )
 
     for attempt in range(3):
-        # Discard stale traffic so a retry cannot be satisfied by an old reply.
         for _ in inport.iter_pending():
             pass
         outport.send(request)
@@ -94,8 +145,7 @@ def request_chunk(inport, outport, addr: int, timeout: float) -> tuple[bytes, by
             for message in inport.iter_pending():
                 decoded = parse_reply(message, addr, count)
                 if decoded is not None:
-                    wire = bytes((0xF0, *message.data, 0xF7))
-                    return decoded, wire
+                    return decoded, bytes((0xF0, *message.data, 0xF7))
             time.sleep(0.002)
         print(f"No reply at EEPROM offset {addr}; retry {attempt + 1}/3", file=sys.stderr)
     raise SystemExit(
@@ -104,16 +154,58 @@ def request_chunk(inport, outport, addr: int, timeout: float) -> tuple[bytes, by
     )
 
 
-def validate_image(image: bytes) -> None:
+def validate_image(image: bytes, *, for_restore: bool = False) -> None:
     if len(image) != EEPROM_SIZE:
         raise ValueError(f"expected {EEPROM_SIZE} bytes, got {len(image)}")
     signature = image[:16].split(b"\0", 1)[0]
     if not signature.startswith(b"OS-303-v0.8"):
         shown = signature.decode("ascii", errors="replace")
         raise ValueError(f"unexpected EEPROM signature {shown!r}")
+    if for_restore and (
+        image[RESTORE_MARKER_A_ADDR] == RESTORE_MARKER_A
+        or image[RESTORE_MARKER_B_ADDR] == RESTORE_MARKER_B
+    ):
+        raise ValueError(
+            "backup contains an active restore-recovery marker; it may have been "
+            "captured from an interrupted restore"
+        )
+
+
+def load_backup(source: Path) -> tuple[bytes, int, int, int]:
+    """Return image and (SysEx, ignored, duplicate) message counts."""
+    chunks: dict[int, bytes] = {}
+    total = ignored = duplicates = 0
+    for data in iter_sysex(source.read_bytes()):
+        total += 1
+        if len(data) < 5 or data[:2] != bytes((MANUFACTURER_ID, CMD_EEPROM_DATA)):
+            ignored += 1
+            continue
+        addr = data[2] | (data[3] << 7)
+        count = data[4]
+        if count != CHUNK_SIZE or addr % CHUNK_SIZE or addr + count > EEPROM_SIZE:
+            raise ValueError(f"invalid OS-303 EEPROM chunk at address {addr}")
+        chunk = unpack_7bit(data[5:], count)
+        if addr in chunks:
+            if chunks[addr] != chunk:
+                raise ValueError(f"conflicting duplicate EEPROM chunk at address {addr}")
+            duplicates += 1
+        else:
+            chunks[addr] = chunk
+
+    expected = set(range(0, EEPROM_SIZE, CHUNK_SIZE))
+    missing = sorted(expected - chunks.keys())
+    if missing:
+        raise ValueError(
+            f"incomplete backup: {len(chunks)}/{CHUNK_COUNT} chunks; "
+            f"first missing EEPROM address is {missing[0]}"
+        )
+    image = b"".join(chunks[addr] for addr in sorted(expected))
+    validate_image(image)
+    return image, total, ignored, duplicates
 
 
 def backup(args) -> None:
+    require_mido()
     input_name = choose_port(mido.get_input_names(), args.input or args.port, "input")
     output_name = choose_port(mido.get_output_names(), args.output or args.port, "output")
     destination = Path(args.file).expanduser()
@@ -153,38 +245,80 @@ def backup(args) -> None:
 
 def verify(args) -> None:
     source = Path(args.file).expanduser()
-    wire = source.read_bytes()
-    image = bytearray(EEPROM_SIZE)
-    seen: set[int] = set()
-    pos = 0
-    while pos < len(wire):
-        start = wire.find(b"\xF0", pos)
-        if start < 0:
-            break
-        end = wire.find(b"\xF7", start + 1)
-        if end < 0:
-            raise SystemExit("Truncated SysEx message at end of file")
-        data = tuple(wire[start + 1 : end])
-        pos = end + 1
-        if len(data) < 5 or data[:2] != (MANUFACTURER_ID, CMD_EEPROM_DATA):
-            continue
-        addr = data[2] | (data[3] << 7)
-        count = data[4]
-        if count == 0 or count > CHUNK_SIZE or addr + count > EEPROM_SIZE:
-            raise SystemExit(f"Invalid EEPROM chunk at address {addr}")
-        chunk = unpack_7bit(data[5:], count)
-        image[addr : addr + count] = chunk
-        seen.update(range(addr, addr + count))
-
-    if len(seen) != EEPROM_SIZE:
-        raise SystemExit(f"Incomplete backup: contains {len(seen)}/{EEPROM_SIZE} EEPROM bytes")
-    validate_image(bytes(image))
+    try:
+        image, total, ignored, duplicates = load_backup(source)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     digest = hashlib.sha256(image).hexdigest()
-    print(f"Valid OS-303 EEPROM backup ({EEPROM_SIZE} bytes)")
+    print(f"Valid OS-303 EEPROM backup ({EEPROM_SIZE} bytes in {CHUNK_COUNT} chunks)")
+    print(f"Messages: {total} SysEx, {ignored} unrelated ignored, {duplicates} duplicates")
     print(f"SHA-256: {digest}")
 
 
+def make_restore_stream(image: bytes) -> bytes:
+    validate_image(image, for_restore=True)
+    checksum = zlib.crc32(image) & 0xFFFFFFFF
+    checksum_bytes = checksum.to_bytes(4, "little")
+    stream = bytearray()
+    stream.extend(
+        sysex_frame(
+            (
+                MANUFACTURER_ID,
+                CMD_RESTORE_BEGIN,
+                RESTORE_PROTOCOL_VERSION,
+                EEPROM_SIZE & 0x7F,
+                (EEPROM_SIZE >> 7) & 0x7F,
+                *pack_7bit(checksum_bytes),
+            )
+        )
+    )
+    for addr in range(0, EEPROM_SIZE, CHUNK_SIZE):
+        chunk = image[addr : addr + CHUNK_SIZE]
+        chunk_crc = crc16_ccitt(chunk).to_bytes(2, "little")
+        stream.extend(
+            sysex_frame(
+                (
+                    MANUFACTURER_ID,
+                    CMD_RESTORE_DATA,
+                    addr & 0x7F,
+                    (addr >> 7) & 0x7F,
+                    CHUNK_SIZE,
+                    *pack_7bit(chunk),
+                    *pack_7bit(chunk_crc),
+                )
+            )
+        )
+    stream.extend(
+        sysex_frame((MANUFACTURER_ID, CMD_RESTORE_END, *pack_7bit(checksum_bytes)))
+    )
+    return bytes(stream)
+
+
+def prepare_restore(args) -> None:
+    source = Path(args.backup).expanduser()
+    destination = Path(args.restore).expanduser()
+    if destination.suffix.lower() != ".syx":
+        destination = destination.with_suffix(".syx")
+    binary_destination = destination.with_suffix(".bin")
+    try:
+        image, total, ignored, duplicates = load_backup(source)
+        stream = make_restore_stream(image)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    destination.write_bytes(stream)
+    binary_destination.write_bytes(image)
+    checksum = zlib.crc32(image) & 0xFFFFFFFF
+    print(f"Validated {CHUNK_COUNT} chunks from {total} SysEx messages")
+    print(f"Ignored {ignored} unrelated messages; removed {duplicates} identical duplicates")
+    print(f"Saved safe restore: {destination} ({CHUNK_COUNT + 2} messages, {len(stream)} bytes)")
+    print(f"Saved raw EEPROM:  {binary_destination}")
+    print(f"CRC-32: {checksum:08x}")
+    print("In SysEx Librarian, set Pause between played messages to at least 150 ms.")
+
+
 def list_ports(_args) -> None:
+    require_mido()
     print("Inputs:")
     for name in mido.get_input_names():
         print(f"  {name}")
@@ -213,6 +347,12 @@ def make_parser() -> argparse.ArgumentParser:
 
     verify_parser = commands.add_parser("verify", help="validate a saved .syx backup")
     verify_parser.add_argument("file", help="backup .syx file")
+
+    restore_parser = commands.add_parser(
+        "prepare-restore", help="validate a backup and create a safe restore .syx"
+    )
+    restore_parser.add_argument("backup", help="recorded backup .syx file")
+    restore_parser.add_argument("restore", help="destination restore .syx file")
     return parser
 
 
@@ -225,6 +365,8 @@ def main() -> None:
         backup(args)
     elif args.command == "verify":
         verify(args)
+    elif args.command == "prepare-restore":
+        prepare_restore(args)
 
 
 if __name__ == "__main__":
