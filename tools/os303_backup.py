@@ -30,6 +30,7 @@ RESTORE_MARKER_A_ADDR = EEPROM_SIZE - 2
 RESTORE_MARKER_B_ADDR = EEPROM_SIZE - 1
 RESTORE_MARKER_A = 0xA5
 RESTORE_MARKER_B = 0x5A
+RESTORE_MARKER_INACTIVE = 0xFF
 
 
 def require_mido() -> None:
@@ -161,13 +162,10 @@ def validate_image(image: bytes, *, for_restore: bool = False) -> None:
     if not signature.startswith(b"OS-303-v0.8"):
         shown = signature.decode("ascii", errors="replace")
         raise ValueError(f"unexpected EEPROM signature {shown!r}")
-    if for_restore and (
-        image[RESTORE_MARKER_A_ADDR] == RESTORE_MARKER_A
-        or image[RESTORE_MARKER_B_ADDR] == RESTORE_MARKER_B
-    ):
+    if for_restore and image[-2:] != bytes((RESTORE_MARKER_INACTIVE,) * 2):
         raise ValueError(
-            "backup contains an active restore-recovery marker; it may have been "
-            "captured from an interrupted restore"
+            "backup does not contain inactive restore-reserved bytes; it may "
+            "have been captured from an interrupted restore"
         )
 
 
@@ -294,6 +292,57 @@ def make_restore_stream(image: bytes) -> bytes:
     return bytes(stream)
 
 
+def load_restore(source: Path) -> bytes:
+    """Validate a canonical restore stream and return its EEPROM image."""
+    messages = list(iter_sysex(source.read_bytes()))
+    if len(messages) != CHUNK_COUNT + 2:
+        raise ValueError(
+            f"restore contains {len(messages)} messages; expected {CHUNK_COUNT + 2}"
+        )
+
+    begin = messages[0]
+    if (
+        len(begin) != 10
+        or begin[:3] != bytes((MANUFACTURER_ID, CMD_RESTORE_BEGIN, RESTORE_PROTOCOL_VERSION))
+        or (begin[3] | (begin[4] << 7)) != EEPROM_SIZE
+    ):
+        raise ValueError("invalid restore BEGIN message")
+    expected_crc = int.from_bytes(unpack_7bit(begin[5:], 4), "little")
+
+    chunks: dict[int, bytes] = {}
+    for index, message in enumerate(messages[1:-1]):
+        if (
+            len(message) != 45
+            or message[:2] != bytes((MANUFACTURER_ID, CMD_RESTORE_DATA))
+            or message[4] != CHUNK_SIZE
+        ):
+            raise ValueError(f"invalid restore DATA message at index {index + 1}")
+        addr = message[2] | (message[3] << 7)
+        if addr % CHUNK_SIZE or addr + CHUNK_SIZE > EEPROM_SIZE or addr in chunks:
+            raise ValueError(f"invalid or duplicate restore address {addr}")
+        chunk = unpack_7bit(message[5:42], CHUNK_SIZE)
+        supplied_crc = int.from_bytes(unpack_7bit(message[42:], 2), "little")
+        if crc16_ccitt(chunk) != supplied_crc:
+            raise ValueError(f"CRC-16 mismatch at restore address {addr}")
+        chunks[addr] = chunk
+
+    expected_addresses = range(0, EEPROM_SIZE, CHUNK_SIZE)
+    missing = [addr for addr in expected_addresses if addr not in chunks]
+    if missing:
+        raise ValueError(f"restore is missing EEPROM address {missing[0]}")
+    image = b"".join(chunks[addr] for addr in expected_addresses)
+    validate_image(image, for_restore=True)
+
+    end = messages[-1]
+    if len(end) != 7 or end[:2] != bytes((MANUFACTURER_ID, CMD_RESTORE_END)):
+        raise ValueError("invalid restore END message")
+    end_crc = int.from_bytes(unpack_7bit(end[2:], 4), "little")
+    actual_crc = zlib.crc32(image) & 0xFFFFFFFF
+    if expected_crc != actual_crc or end_crc != actual_crc:
+        raise ValueError("restore CRC-32 mismatch")
+    return image
+
+
 def prepare_restore(args) -> None:
     source = Path(args.backup).expanduser()
     destination = Path(args.restore).expanduser()
@@ -315,6 +364,17 @@ def prepare_restore(args) -> None:
     print(f"Saved raw EEPROM:  {binary_destination}")
     print(f"CRC-32: {checksum:08x}")
     print("In SysEx Librarian, set Pause between played messages to at least 200 ms.")
+
+
+def verify_restore(args) -> None:
+    source = Path(args.file).expanduser()
+    try:
+        image = load_restore(source)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"Valid OS-303 restore ({CHUNK_COUNT + 2} messages, {len(image)} EEPROM bytes)")
+    print(f"CRC-32: {zlib.crc32(image) & 0xFFFFFFFF:08x}")
+    print(f"SHA-256: {hashlib.sha256(image).hexdigest()}")
 
 
 def list_ports(_args) -> None:
@@ -353,6 +413,11 @@ def make_parser() -> argparse.ArgumentParser:
     )
     restore_parser.add_argument("backup", help="recorded backup .syx file")
     restore_parser.add_argument("restore", help="destination restore .syx file")
+
+    verify_restore_parser = commands.add_parser(
+        "verify-restore", help="validate a prepared restore .syx"
+    )
+    verify_restore_parser.add_argument("file", help="prepared restore .syx file")
     return parser
 
 
@@ -367,6 +432,8 @@ def main() -> None:
         verify(args)
     elif args.command == "prepare-restore":
         prepare_restore(args)
+    elif args.command == "verify-restore":
+        verify_restore(args)
 
 
 if __name__ == "__main__":

@@ -40,11 +40,25 @@ def backup_stream(image: bytes) -> bytes:
     return bytes(stream)
 
 
+def write_temp(directory: str, name: str, data: bytes) -> Path:
+    path = Path(directory, name)
+    path.write_bytes(data)
+    return path
+
+
 class BackupToolTests(unittest.TestCase):
     def test_pack_round_trip_and_crc_reference(self):
-        raw = bytes(range(256))
-        self.assertEqual(backup.unpack_7bit(backup.pack_7bit(raw), len(raw)), raw)
+        for length in range(65):
+            raw = bytes((index * 37 + length) & 0xFF for index in range(length))
+            self.assertEqual(backup.unpack_7bit(backup.pack_7bit(raw), length), raw)
         self.assertEqual(backup.crc16_ccitt(b"123456789"), 0x29B1)
+
+    def test_unpack_rejects_truncated_and_trailing_data(self):
+        packed = backup.pack_7bit(bytes(range(10)))
+        with self.assertRaises(ValueError):
+            backup.unpack_7bit(packed[:-1], 10)
+        with self.assertRaises(ValueError):
+            backup.unpack_7bit(packed + b"\0", 10)
 
     def test_load_backup_filters_noise_and_duplicate(self):
         image = sample_image()
@@ -57,6 +71,22 @@ class BackupToolTests(unittest.TestCase):
             loaded, total, ignored, duplicates = backup.load_backup(path)
         self.assertEqual(loaded, image)
         self.assertEqual((total, ignored, duplicates), (130, 1, 1))
+
+    def test_load_backup_rejects_missing_and_conflicting_chunks(self):
+        image = sample_image()
+        stream = backup_stream(image)
+        with tempfile.TemporaryDirectory() as directory:
+            missing = write_temp(directory, "missing.syx", stream[44:])
+            with self.assertRaisesRegex(ValueError, "incomplete backup"):
+                backup.load_backup(missing)
+
+            conflict = bytearray(stream[:44])
+            conflict[7] ^= 1
+            conflicting = write_temp(
+                directory, "conflicting.syx", stream + bytes(conflict)
+            )
+            with self.assertRaisesRegex(ValueError, "conflicting duplicate"):
+                backup.load_backup(conflicting)
 
     def test_restore_stream_has_begin_data_and_end_frames(self):
         image = sample_image()
@@ -82,11 +112,35 @@ class BackupToolTests(unittest.TestCase):
         self.assertEqual(bytes(restored), image)
         self.assertEqual(end_crc, expected_crc)
 
+        with tempfile.TemporaryDirectory() as directory:
+            restore = write_temp(directory, "restore.syx", stream)
+            self.assertEqual(backup.load_restore(restore), image)
+
+    def test_restore_validator_rejects_corruption_and_missing_message(self):
+        stream = backup.make_restore_stream(sample_image())
+        messages = [backup.sysex_frame(message) for message in backup.iter_sysex(stream)]
+        corrupted = bytearray(messages[5])
+        corrupted[10] ^= 1
+        messages[5] = bytes(corrupted)
+        with tempfile.TemporaryDirectory() as directory:
+            bad_crc = write_temp(directory, "bad-crc.syx", b"".join(messages))
+            with self.assertRaisesRegex(ValueError, "CRC-16 mismatch"):
+                backup.load_restore(bad_crc)
+
+            missing = write_temp(directory, "missing.syx", b"".join(messages[:-2] + messages[-1:]))
+            with self.assertRaisesRegex(ValueError, "expected 130"):
+                backup.load_restore(missing)
+
     def test_prepare_rejects_recovery_marker(self):
-        image = bytearray(sample_image())
-        image[backup.RESTORE_MARKER_A_ADDR] = backup.RESTORE_MARKER_A
-        with self.assertRaises(ValueError):
-            backup.make_restore_stream(bytes(image))
+        for addr, marker in (
+            (backup.RESTORE_MARKER_A_ADDR, backup.RESTORE_MARKER_A),
+            (backup.RESTORE_MARKER_B_ADDR, backup.RESTORE_MARKER_B),
+            (backup.RESTORE_MARKER_A_ADDR, 0x00),
+        ):
+            image = bytearray(sample_image())
+            image[addr] = marker
+            with self.assertRaises(ValueError):
+                backup.make_restore_stream(bytes(image))
 
 
 if __name__ == "__main__":
