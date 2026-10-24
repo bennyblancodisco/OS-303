@@ -588,7 +588,13 @@ static void run_restore_mode() {
 
   uint16_t frame = 0;
   while (!restore_finished) {
-    while (MIDI.read()) {}
+    // Default MIDI settings parse one byte per read() call and return false
+    // until a complete message is assembled. Draining on read()'s return value
+    // therefore consumes only one byte per LED refresh and can overflow the
+    // UART buffer while EEPROM writes are in progress. Drain every byte that
+    // has already arrived instead.
+    while (Serial1.available())
+      MIDI.read();
     PollInputs(inputs);
 
     if (restore_error >= 0x40) {
