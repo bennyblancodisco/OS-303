@@ -83,6 +83,8 @@ static elapsedMicros dac_timer;
 // static elapsedMillis led_timer;
 static elapsedMillis pattern_cleared_flash_timer;
 static constexpr uint16_t PATTERN_CLEARED_FLASH_MS = 400;
+static uint8_t probability_bank = 0;
+static int8_t probability_step = -1;
 
 ClockEngine clock_;
 Engine engine(clock_);
@@ -92,6 +94,7 @@ enum UIMode {
   NORMAL_MODE,
   PITCH_MODE,
   TIME_MODE,
+  PROBABILITY_MODE,
   MENU_CONFIG,
   MENU_PITCH,
   MENU_TIME,
@@ -458,6 +461,69 @@ void PrintChain(uint8_t stepidx) {
   Leds::Set(DSHARP_KEY_LED, (data >> 5) & 1);
   Leds::Set(FSHARP_KEY_LED, (data >> 6) & 1);
   Leds::Set(GSHARP_KEY_LED, (data >> 7) & 1);
+}
+
+// Live per-step trigger probability editor. Enter from Pattern Write by
+// holding Time and tapping Slide. Black keys select an eight-step bank, the
+// numbered keys select a step, and Down/Up change 0/33/67/100%.
+void ProcessProbabilityMode() {
+  if (!write_mode || track_mode) {
+    SetMode(NORMAL_MODE);
+    probability_step = -1;
+    return;
+  }
+
+  static uint8_t last_pattern = 0xff;
+  const uint8_t current_pattern = engine.get_patsel();
+  if (current_pattern != last_pattern) {
+    last_pattern = current_pattern;
+    probability_step = -1;
+  }
+
+  const bool blink = bool((millis() >> 8) & 1);
+  Leds::Set(FUNCTION_MODE_LED, true);
+  Leds::Set(TIME_MODE_LED, true);
+  Leds::Set(SLIDE_KEY_LED, blink);
+
+  if (inputs[CSHARP_KEY].rising()) probability_bank = 0;
+  if (inputs[DSHARP_KEY].rising()) probability_bank = 8;
+  if (inputs[FSHARP_KEY].rising()) probability_bank = 16;
+  if (inputs[GSHARP_KEY].rising()) probability_bank = 24;
+
+  Leds::Set(CSHARP_KEY_LED, probability_bank == 0);
+  Leds::Set(DSHARP_KEY_LED, probability_bank == 8);
+  Leds::Set(FSHARP_KEY_LED, probability_bank == 16);
+  Leds::Set(GSHARP_KEY_LED, probability_bank == 24);
+
+  for (uint8_t i = 0; i < 8; ++i) {
+    const uint8_t step = probability_bank + i;
+    if (step >= engine.get_length()) continue;
+    if (inputs[i].rising()) probability_step = int8_t(step);
+    Leds::Set(OutputIndex(i), engine.get_probability(step) < StepProbability::kMaxLevel);
+  }
+
+  if (inputs[BACK_KEY].rising()) probability_step = -1;
+  if (probability_step >= int8_t(engine.get_length())) probability_step = -1;
+
+  if (probability_step >= 0) {
+    uint8_t level = engine.get_probability(uint8_t(probability_step));
+    if (inputs[DOWN_KEY].rising() && level > 0) --level;
+    if (inputs[UP_KEY].rising() && level < StepProbability::kMaxLevel) ++level;
+    engine.SetProbability(uint8_t(probability_step), level);
+
+    // Three LEDs form a compact level meter: none=0%, one=33%, two=67%,
+    // three=100%. The selected numbered LED blinks over the edited-step map.
+    Leds::Set(DOWN_KEY_LED, level >= 1);
+    Leds::Set(UP_KEY_LED, level >= 2);
+    Leds::Set(ACCENT_KEY_LED, level >= 3);
+    if ((uint8_t(probability_step) & 0xf8) == probability_bank)
+      Leds::Set(OutputIndex(uint8_t(probability_step) & 0x07), blink);
+  }
+
+  if (inputs[FUNCTION_KEY].rising()) {
+    SetMode(NORMAL_MODE);
+    probability_step = -1;
+  }
 }
 
 // --- UI context/mode helpers ---
@@ -1029,7 +1095,11 @@ void loop() {
           play_pattern = check_pitch_held();
         } else if (time_mod) {
           Leds::Set(TIME_MODE_LED, MED_FLASH);
-          // TODO: performance time effects
+          if (write_mode && !track_mode && inputs[SLIDE_KEY].rising()) {
+            probability_bank = 0;
+            probability_step = -1;
+            SetMode(PROBABILITY_MODE);
+          }
         } else if (fn_mod) {
           ProcessFunctionMod();
         } else {
@@ -1049,6 +1119,13 @@ void loop() {
     case MENU_TIME:
       ProcessTimeMenu();
       play_pattern = 0;
+      break;
+
+    case PROBABILITY_MODE:
+      ProcessProbabilityMode();
+      // Numbered keys select steps here; they must not also gate the existing
+      // hold-a-pattern performance mode.
+      play_pattern = 1;
       break;
   }
 
@@ -1104,9 +1181,11 @@ void loop() {
   }
 
   // --- other input handling
-  if (inputs[TIME_KEY].rising() && write_mode) SetMode(TIME_MODE, !clk_run);
+  if (inputs[TIME_KEY].rising() && write_mode && get_mode() != PROBABILITY_MODE)
+    SetMode(TIME_MODE, !clk_run);
   if (inputs[PITCH_KEY].rising() && write_mode) SetMode(PITCH_MODE, !clk_run);
-  if (inputs[FUNCTION_KEY].rising()) SetMode(NORMAL_MODE, !clk_run);
+  if (inputs[FUNCTION_KEY].rising() && get_mode() != PROBABILITY_MODE)
+    SetMode(NORMAL_MODE, !clk_run);
   if (inputs[CLEAR_KEY].rising()) {
     // press CLEAR while holding one or more pattern slots
     for (uint8_t i = 0; i < 8; ++i) {
