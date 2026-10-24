@@ -363,7 +363,7 @@ def prepare_restore(args) -> None:
     print(f"Saved safe restore: {destination} ({CHUNK_COUNT + 2} messages, {len(stream)} bytes)")
     print(f"Saved raw EEPROM:  {binary_destination}")
     print(f"CRC-32: {checksum:08x}")
-    print("In SysEx Librarian, set Pause between played messages to at least 200 ms.")
+    print("In SysEx Librarian, set Pause between played messages to at least 500 ms.")
 
 
 def verify_restore(args) -> None:
