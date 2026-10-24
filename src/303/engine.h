@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include "drivers.h"
+#include "step_probability.h"
 #include "../clock.h"
 
 static constexpr int MAX_STEPS = 32;
@@ -44,6 +45,15 @@ static constexpr size_t AUX_DATA_OFFSET = TRACK_DATA_OFFSET + TRACK_DATA_SIZE;
 static constexpr int AUX_DATA_SIZE = 4096 - AUX_DATA_OFFSET;
 static_assert(AUX_DATA_SIZE >= 0, "EEPROM OVERFLOW!");
 
+// Two bits per step across all 64 patterns: 0%, 33%, 67%, or 100% trigger
+// probability. This occupies 512 bytes of the previously unused AUX region.
+static constexpr size_t PROBABILITY_DATA_OFFSET = AUX_DATA_OFFSET;
+static constexpr size_t PROBABILITY_DATA_SIZE = StepProbability::kStorageBytes;
+static constexpr size_t PROBABILITY_FORMAT_OFFSET =
+    PROBABILITY_DATA_OFFSET + PROBABILITY_DATA_SIZE;
+static_assert(PROBABILITY_FORMAT_OFFSET + StepProbability::kFormatMarkerSize <= 4096,
+              "PROBABILITY EEPROM OVERFLOW!");
+
 // Signature - max 15 characters (+ null terminator)
 // Shorter strings will match longer ones as a prefix, so appending characters
 // retains compatibility with upstream and old versions, etc.
@@ -66,6 +76,7 @@ struct Sequence {
   uint8_t transpose = 0;
   uint8_t engine_select = 0;
   uint8_t length = 16;
+  uint8_t probability[StepProbability::kBytesPerPattern];
   // --- end sequence data
 
   // state
@@ -74,7 +85,13 @@ struct Sequence {
   bool reset_pitch;
 
   Sequence& operator=(const Sequence& src) {
-    memcpy(pitch, src.pitch, sizeof(pitch) + sizeof(time_data) + METADATA_SIZE);
+    memcpy(pitch, src.pitch, sizeof(pitch));
+    memcpy(time_data, src.time_data, sizeof(time_data));
+    memcpy(reserved, src.reserved, sizeof(reserved));
+    transpose = src.transpose;
+    engine_select = src.engine_select;
+    length = src.length;
+    memcpy(probability, src.probability, sizeof(probability));
     return *this;
   }
 
@@ -227,6 +244,14 @@ struct Sequence {
       time_data[i>>2] = 0; // all rests
     }
     length = 8;
+    memset(probability, 0xff, sizeof(probability));
+  }
+
+  uint8_t GetProbability(uint8_t step) const {
+    return StepProbability::get(probability, step & (MAX_STEPS - 1));
+  }
+  void SetProbability(uint8_t step, uint8_t level) {
+    StepProbability::set(probability, step & (MAX_STEPS - 1), level);
   }
 
   // returns false for rests
@@ -389,6 +414,8 @@ inline void WritePattern(Sequence &seq, int idx) {
   for (uint8_t i = 0; i < METADATA_SIZE; ++i) {
     storage.update(PATTERN_DATA_OFFSET + (idx * METADATA_SIZE) + i, src[i]);
   }
+  storage.put(PROBABILITY_DATA_OFFSET + (idx * StepProbability::kBytesPerPattern),
+              seq.probability);
 }
 inline void ReadPattern(Sequence &seq, int idx) {
   storage.get(PITCH_DATA_OFFSET + (idx * PITCH_SIZE), seq.pitch);
@@ -398,6 +425,8 @@ inline void ReadPattern(Sequence &seq, int idx) {
   for (uint8_t i = 0; i < METADATA_SIZE; ++i) {
     dst[i] = storage.read(PATTERN_DATA_OFFSET + (idx * METADATA_SIZE) + i);
   }
+  storage.get(PROBABILITY_DATA_OFFSET + (idx * StepProbability::kBytesPerPattern),
+              seq.probability);
 }
 
 enum PlaybackDirection : int8_t {
@@ -432,8 +461,9 @@ struct Engine {
   uint16_t qmask = 0x0fff; // quantizer scale mask
 
   ClockEngine &clock_;
+  StepProbability::Random probability_random_;
 
-  Engine(ClockEngine &cl) : clock_(cl) {}
+  Engine(ClockEngine &cl) : clock_(cl), probability_random_(0x6d2b) {}
 
   inline bool Init(const bool reset_memory) {
 #if DEBUG
@@ -441,7 +471,12 @@ struct Engine {
 #endif
 
     GlobalSettings.Load();
-    if (GlobalSettings.Validate() && !reset_memory) {
+    const bool settings_valid = GlobalSettings.Validate();
+    StepProbability::ensure_storage(storage, PROBABILITY_DATA_OFFSET,
+                                    PROBABILITY_FORMAT_OFFSET,
+                                    reset_memory || !settings_valid);
+    probability_random_.reseed(uint16_t(micros()) ^ 0x6d2b);
+    if (settings_valid && !reset_memory) {
       Load(0);
       return true;
     }
@@ -545,7 +580,9 @@ struct Engine {
   bool Advance(int direction = 1) {
     // start sliding before advancing
     // Slide: goes high when leaving a slide, stays high when arriving at a tie, otherwise, cancel
-    slide_on = get_sequence().get_slide() || (slide_on && get_sequence().next_is_tie(direction));
+    slide_on = !resting &&
+               (get_sequence().get_slide() ||
+                (slide_on && get_sequence().next_is_tie(direction)));
 
     bool result = get_sequence().Advance(direction);
     // jump to next pattern at end of current one
@@ -567,6 +604,15 @@ struct Engine {
 
     // ignore Tie after a Rest
     if (resting && result && get_sequence().is_tie()) result = false;
+
+    // A probability miss turns this pass of a NOTE/RATCHET into a rest. The
+    // Sequence has already advanced its pitch stream, keeping later notes
+    // aligned with their programmed pitches. Ties inherit the resulting rest.
+    if (result && (get_time() & 1) &&
+        !StepProbability::passes(get_probability(get_time_pos()),
+                                 probability_random_.next())) {
+      result = false;
+    }
 
     if (result) { // -- state transition for new step
       // Gate: held high only when THIS step extends into the next (slide out or tie).
@@ -773,6 +819,9 @@ struct Engine {
   const uint16_t get_qmask() const {
     return GlobalSettings.qmask;
   }
+  uint8_t get_probability(uint8_t step) const {
+    return get_sequence().GetProbability(step);
+  }
 
   // setters
   void SetPattern(uint8_t p_, bool override = false) {
@@ -840,6 +889,9 @@ struct Engine {
   }
   void SetTime(uint8_t t) {
     get_sequence().SetTime(t, clk_count > 3);
+  }
+  void SetProbability(uint8_t step, uint8_t level) {
+    get_sequence().SetProbability(step, level);
   }
 
   void ToggleSlide() {
